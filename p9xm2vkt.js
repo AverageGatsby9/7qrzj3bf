@@ -2,7 +2,7 @@ twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 20;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
         window.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
@@ -35,11 +35,13 @@ twitch-videoad.js text/javascript
         scope.AuthorizationHeader = undefined;
         scope.SimulatedAdsDepth = 0;
         scope.PlayerBufferingFix = true;// If true this will pause/play the player when it gets stuck buffering
-        scope.PlayerBufferingDelay = 500;// How often should we check the player state (in milliseconds)
+        scope.PlayerBufferingDelay = 600;// How often should we check the player state (in milliseconds)
         scope.PlayerBufferingSameStateCount = 3;// How many times of seeing the same player state until we trigger pause/play (it will only trigger it one time until the player state changes again)
         scope.PlayerBufferingDangerZone = 1;// The buffering time left (in seconds) when we should ignore the players playback position in the player state check
         scope.PlayerBufferingDoPlayerReload = false;// If true this will do a player reload instead of pause/play (player reloading is better at fixing the playback issues but it takes slightly longer)
-        scope.PlayerBufferingMinRepeatDelay = 5000;// Minimum delay (in milliseconds) between each pause/play (this is to avoid over pressing pause/play when there are genuine buffering problems)
+        scope.PlayerBufferingMinRepeatDelay = 8000;// Minimum delay (in milliseconds) between each pause/play (this is to avoid over pressing pause/play when there are genuine buffering problems)
+        scope.PlayerBufferingPrerollCheckEnabled = false;// Enable this if you're getting an immediate pause/play/reload as you open a stream (which is causing the stream to take longer to load). One problem with this being true is that it can cause the player to get stuck in some instances requiring the user to press pause/play
+        scope.PlayerBufferingPrerollCheckOffset = 5;// How far the stream need to move before doing the buffering mitigation (depends on PlayerBufferingPrerollCheckEnabled being true)
         scope.V2API = false;
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
@@ -410,7 +412,7 @@ twitch-videoad.js text/javascript
             streamInfo.NumStrippedAdSegments = 0;
         }
         streamInfo.IsStrippingAdSegments = hasStrippedAdSegments;
-        AdSegmentCache.forEach((key, value, map) => {
+        AdSegmentCache.forEach((value, key, map) => {
             if (value < Date.now() - 120000) {
                 map.delete(key);
             }
@@ -641,6 +643,7 @@ twitch-videoad.js text/javascript
     }
     function gqlRequest(body, playerType) {
         if (!GQLDeviceID) {
+            GQLDeviceID = '';
             const dcharacters = 'abcdefghijklmnopqrstuvwxyz0123456789';
             const dcharactersLength = dcharacters.length;
             for (let i = 0; i < 32; i++) {
@@ -678,6 +681,8 @@ twitch-videoad.js text/javascript
     }
     let playerForMonitoringBuffering = null;
     const playerBufferState = {
+        channelName: null,
+        hasStreamStarted: false,
         position: 0,
         bufferedPosition: 0,
         bufferDuration: 0,
@@ -693,32 +698,53 @@ twitch-videoad.js text/javascript
                 if (!player.core) {
                     playerForMonitoringBuffering = null;
                 } else if (state.props?.content?.type === 'live' && !player.isPaused() && !player.getHTMLVideoElement()?.ended && playerBufferState.lastFixTime <= Date.now() - PlayerBufferingMinRepeatDelay && !isActivelyStrippingAds) {
+                    const m3u8Url = player.core?.state?.path;
+                    if (m3u8Url) {
+                      const fileName = new URL(m3u8Url).pathname.split('/').pop();
+                      if (fileName?.endsWith('.m3u8')) {
+                          const channelName = fileName.slice(0, -5);
+                          if (playerBufferState.channelName != channelName) {
+                              playerBufferState.channelName = channelName;
+                              playerBufferState.hasStreamStarted = false;
+                              playerBufferState.numSame = 0;
+                              //console.log('Channel changed to ' + channelName);
+                          }
+                      }
+                    }
+                    if (player.getState() === 'Playing') {
+                        playerBufferState.hasStreamStarted = true;
+                    }
                     const position = player.core?.state?.position;
                     const bufferedPosition = player.core?.state?.bufferedPosition;
                     const bufferDuration = player.getBufferDuration();
-                    //console.log('position:' + position + ' bufferDuration:' + bufferDuration + ' bufferPosition:' + bufferedPosition);
-                    // NOTE: This could be improved. It currently lets the player fully eat the full buffer before it triggers pause/play
-                    if (position > 5 &&// changed from >0 to >5 due to issues with prerolls. TODO: Improve this, player could get stuck
-                        (playerBufferState.position == position || bufferDuration < PlayerBufferingDangerZone)  &&
-                        playerBufferState.bufferedPosition == bufferedPosition &&
-                        playerBufferState.bufferDuration >= bufferDuration &&
-                        (position != 0 || bufferedPosition != 0 || bufferDuration != 0)
-                       ) {
-                        playerBufferState.numSame++;
-                        if (playerBufferState.numSame == PlayerBufferingSameStateCount) {
-                            console.log('Attempt to fix buffering position:' + playerBufferState.position + ' bufferedPosition:' + playerBufferState.bufferedPosition + ' bufferDuration:' + playerBufferState.bufferDuration);
-                            doTwitchPlayerTask(!PlayerBufferingDoPlayerReload, PlayerBufferingDoPlayerReload, false);
-                            const isPausePlay = !PlayerBufferingDoPlayerReload;
-                            const isReload = PlayerBufferingDoPlayerReload;
-                            doTwitchPlayerTask(isPausePlay, isReload);
-                            playerBufferState.lastFixTime = Date.now();
+                    if (position !== undefined && bufferedPosition !== undefined) {
+                        //console.log('position:' + position + ' bufferDuration:' + bufferDuration + ' bufferPosition:' + bufferedPosition + ' state: ' + player.core?.state?.state + ' started: ' + playerBufferState.hasStreamStarted);
+                        // NOTE: This could be improved. It currently lets the player fully eat the full buffer before it triggers pause/play
+                        if (playerBufferState.hasStreamStarted &&
+                            (!PlayerBufferingPrerollCheckEnabled || position > PlayerBufferingPrerollCheckOffset) &&
+                            (playerBufferState.position == position || bufferDuration < PlayerBufferingDangerZone)  &&
+                            playerBufferState.bufferedPosition == bufferedPosition &&
+                            playerBufferState.bufferDuration >= bufferDuration &&
+                            (position != 0 || bufferedPosition != 0 || bufferDuration != 0)
+                        ) {
+                            playerBufferState.numSame++;
+                            if (playerBufferState.numSame == PlayerBufferingSameStateCount) {
+                                console.log('Attempt to fix buffering position:' + playerBufferState.position + ' bufferedPosition:' + playerBufferState.bufferedPosition + ' bufferDuration:' + playerBufferState.bufferDuration);
+                                const isPausePlay = !PlayerBufferingDoPlayerReload;
+                                const isReload = PlayerBufferingDoPlayerReload;
+                                doTwitchPlayerTask(isPausePlay, isReload);
+                                playerBufferState.lastFixTime = Date.now();
+                                playerBufferState.numSame = 0;
+                            }
+                        } else {
+                            playerBufferState.numSame = 0;
                         }
+                        playerBufferState.position = position;
+                        playerBufferState.bufferedPosition = bufferedPosition;
+                        playerBufferState.bufferDuration = bufferDuration;
                     } else {
                         playerBufferState.numSame = 0;
                     }
-                    playerBufferState.position = position;
-                    playerBufferState.bufferedPosition = bufferedPosition;
-                    playerBufferState.bufferDuration = bufferDuration;
                 }
             } catch (err) {
                 console.error('error when monitoring player for buffering: ' + err);
@@ -798,6 +824,9 @@ twitch-videoad.js text/javascript
         }
         let player = findReactNode(reactRootNode, node => node.setPlayerActive && node.props && node.props.mediaPlayerInstance);
         player = player && player.props && player.props.mediaPlayerInstance ? player.props.mediaPlayerInstance : null;
+        if (player?.playerInstance) {
+            player = player.playerInstance;
+        }
         const playerState = findReactNode(reactRootNode, node => node.setSrc && node.setInitialPlaybackSettings);
         return  {
             player: player,
@@ -823,6 +852,8 @@ twitch-videoad.js text/javascript
         if (player.isPaused() || player.core?.paused) {
             return;
         }
+        playerBufferState.lastFixTime = Date.now();
+        playerBufferState.numSame = 0;
         if (isPausePlay) {
             player.pause();
             player.play();
@@ -922,6 +953,10 @@ twitch-videoad.js text/javascript
                     if (typeof init.headers['Authorization'] === 'string' && init.headers['Authorization'] !== AuthorizationHeader) {
                         postTwitchWorkerMessage('UpdateAuthorizationHeader', AuthorizationHeader = init.headers['Authorization']);
                     }
+                    // Get rid of mini player above chat - TODO: Reject this locally instead of having server reject it
+                    if (init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken') && init.body.includes('picture-by-picture')) {
+                        init.body = '';
+                    }
                     if (ForceAccessTokenPlayerType && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
                         let replacedPlayerType = '';
                         const newBody = JSON.parse(init.body);
@@ -942,10 +977,6 @@ twitch-videoad.js text/javascript
                             console.log(`Replaced '${replacedPlayerType}' player type with '${ForceAccessTokenPlayerType}' player type`);
                             init.body = JSON.stringify(newBody);
                         }
-                    }
-                    // Get rid of mini player above chat - TODO: Reject this locally instead of having server reject it
-                    if (init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken') && init.body.includes('picture-by-picture')) {
-                        init.body = '';
                     }
                 }
             }
@@ -978,12 +1009,17 @@ twitch-videoad.js text/javascript
         };
         let wasVideoPlaying = true;
         const visibilityChange = e => {
-            if (typeof chrome !== 'undefined') {
-                const videos = document.getElementsByTagName('video');
-                if (videos.length > 0) {
-                    if (hidden.apply(document) === true || (webkitHidden && webkitHidden.apply(document) === true)) {
-                        wasVideoPlaying = !videos[0].paused && !videos[0].ended;
-                    } else if (wasVideoPlaying && !videos[0].ended && videos[0].paused && videos[0].muted) {
+            const isChrome = typeof chrome !== 'undefined';
+            const videos = document.getElementsByTagName('video');
+            if (videos.length > 0) {
+                if (hidden.apply(document) === true || (webkitHidden && webkitHidden.apply(document) === true)) {
+                    wasVideoPlaying = !videos[0].paused && !videos[0].ended;
+                } else {
+                    if (!playerBufferState.hasStreamStarted) {
+                        //console.log('Tab focused. Stream should be active');
+                        playerBufferState.hasStreamStarted = true;
+                    }
+                    if (isChrome && wasVideoPlaying && !videos[0].ended && videos[0].paused && videos[0].muted) {
                         videos[0].play();
                     }
                 }
